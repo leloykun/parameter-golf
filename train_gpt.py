@@ -201,9 +201,7 @@ def matrix_invroot(
     Pn = (P / frob_safe.to(dtype=P.dtype) + eps * eye).to(dtype=P.dtype)
     out = eye.expand(P.shape).clone()
     for a, b, c in _abc(r=r, steps=steps, scale=scale):
-        a_t = P.new_tensor(a)
-        b_t = P.new_tensor(b)
-        c_t = P.new_tensor(c)
+        a_t, b_t, c_t = P.new_tensor(a), P.new_tensor(b), P.new_tensor(c)
         W = a_t * eye + b_t * Pn + c_t * (Pn @ Pn)
         W1 = W
         W2 = W @ W
@@ -1128,8 +1126,8 @@ def main() -> None:
     args = Hyperparameters()
 
     global _dualize_lora_muon_pair, _power_iteration
-    _dualize_lora_muon_pair = torch.compile(_dualize_lora_muon_pair)
-    _power_iteration = torch.compile(_power_iteration)
+    _dualize_lora_muon_pair = torch.compile(_dualize_lora_muon_pair, dynamic=False, fullgraph=True)
+    _power_iteration = torch.compile(_power_iteration, dynamic=False, fullgraph=True)
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
