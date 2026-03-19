@@ -89,9 +89,11 @@ class Hyperparameters:
     gauge_rebalance_interval = int(os.environ.get("GAUGE_REBALANCE_INTERVAL", 128))
     gauge_rebalance_alpha = float(os.environ.get("GAUGE_REBALANCE_ALPHA", 0.1))
     gauge_rebalance_eps = float(os.environ.get("GAUGE_REBALANCE_EPS", 1e-12))
+    weight_decay = float(os.environ.get("WEIGHT_DECAY", 0.1))
     enable_nsight_profile = bool(int(os.environ.get("ENABLE_NSIGHT_PROFILE", "0")))
     nsight_profile_start_step = int(os.environ.get("NSIGHT_PROFILE_START_STEP", 10))
     nsight_profile_steps = int(os.environ.get("NSIGHT_PROFILE_STEPS", 1))
+    nsight_detailed_labels = bool(int(os.environ.get("NSIGHT_DETAILED_LABELS", "1")))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -271,16 +273,20 @@ class NsightProfiler:
             dist.barrier()
 
     def step_start(self, step: int) -> None:
+        global _NVTX_LABELS_ACTIVE
         if self.enabled and not self.active and step == self.start_step:
             self._sync()
             torch.cuda.cudart().cudaProfilerStart()
             self.active = True
+            _NVTX_LABELS_ACTIVE = True
 
     def step_end(self, step: int) -> None:
+        global _NVTX_LABELS_ACTIVE
         if self.active and step >= self.stop_step:
             self._sync()
             torch.cuda.cudart().cudaProfilerStop()
             self.active = False
+            _NVTX_LABELS_ACTIVE = False
 
     def push(self, name: str) -> None:
         if self.active:
@@ -289,6 +295,29 @@ class NsightProfiler:
     def pop(self) -> None:
         if self.active:
             torch.cuda.nvtx.range_pop()
+
+
+_NVTX_LABELS_ACTIVE = False
+
+
+class _NvtxRange:
+    def __init__(self, name: str):
+        self.name = name
+        self._pushed = False
+
+    def __enter__(self):
+        if _NVTX_LABELS_ACTIVE:
+            torch.cuda.nvtx.range_push(self.name)
+            self._pushed = True
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._pushed:
+            torch.cuda.nvtx.range_pop()
+
+
+def nvtx_range(name: str) -> _NvtxRange:
+    return _NvtxRange(name)
 
 
 class LoRAMuon(torch.optim.Optimizer):
@@ -365,93 +394,104 @@ class LoRAMuon(torch.optim.Optimizer):
             if weight_decay != 0.0 and lr * weight_decay >= 1.0:
                 raise ValueError("LoRA decoupled weight decay requires lr * weight_decay < 1.")
 
-            total_params = sum(int(p.numel()) for p in params)
-            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
+            with nvtx_range("lora_muon.transform"):
+                total_params = sum(int(p.numel()) for p in params)
+                updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
 
-            curr = 0
-            for pair_idx in range(0, len(params), 2):
-                A = params[pair_idx]
-                B = params[pair_idx + 1]
-                pair_numel = int(A.numel() + B.numel())
-                # Keep the original Muon ownership model, but assign coupled LoRA
-                # factors to the same rank so the transform can be computed locally.
-                if pair_idx // 2 % world_size == rank:
-                    if A.grad is None and B.grad is None:
-                        curr += pair_numel
-                        continue
-                    if A.grad is None or B.grad is None:
-                        raise RuntimeError("Both LoRA factor gradients must be present.")
+                curr = 0
+                for pair_idx in range(0, len(params), 2):
+                    A = params[pair_idx]
+                    B = params[pair_idx + 1]
+                    pair_numel = int(A.numel() + B.numel())
+                    # Keep the original Muon ownership model, but assign coupled LoRA
+                    # factors to the same rank so the transform can be computed locally.
+                    if pair_idx // 2 % world_size == rank:
+                        if A.grad is None and B.grad is None:
+                            curr += pair_numel
+                            continue
+                        if A.grad is None or B.grad is None:
+                            raise RuntimeError("Both LoRA factor gradients must be present.")
 
-                    state_A = self.state[A]
-                    state_B = self.state[B]
-                    if "momentum" not in state_A:
-                        state_A["momentum"] = torch.zeros_like(A)
-                    if "momentum" not in state_B:
-                        state_B["momentum"] = torch.zeros_like(B)
-                    mA = state_A["momentum"]
-                    mB = state_B["momentum"]
+                        state_A = self.state[A]
+                        state_B = self.state[B]
+                        if "momentum" not in state_A:
+                            state_A["momentum"] = torch.zeros_like(A)
+                        if "momentum" not in state_B:
+                            state_B["momentum"] = torch.zeros_like(B)
+                        mA = state_A["momentum"]
+                        mB = state_B["momentum"]
 
-                    gA = A.grad.detach()
-                    gB = B.grad.detach()
-                    mA.mul_(momentum).add_(gA)
-                    mB.mul_(momentum).add_(gB)
-                    eff_gA = gA.add(mA, alpha=momentum) if nesterov else mA
-                    eff_gB = gB.add(mB, alpha=momentum) if nesterov else mB
+                        gA = A.grad.detach()
+                        gB = B.grad.detach()
+                        mA.mul_(momentum).add_(gA)
+                        mB.mul_(momentum).add_(gB)
+                        eff_gA = gA.add(mA, alpha=momentum) if nesterov else mA
+                        eff_gB = gB.add(mB, alpha=momentum) if nesterov else mB
 
-                    A_fp32 = A.detach().to(torch.float32)
-                    B_fp32 = B.detach().to(torch.float32)
-                    B_factor_fp32 = B_fp32.mT
-                    matrix_scale = math.sqrt(float(A.shape[-2]) / float(B.shape[-1]))
-                    dA_step, dB_factor_step = _dualize_lora_muon_pair(
-                        grad_A=eff_gA,
-                        grad_B=eff_gB.mT,
-                        A=A_fp32,
-                        B=B_factor_fp32,
-                        ns_steps=ns_steps,
-                        inv_eps=inv_eps,
-                        inv_scale=inv_scale,
-                    )
-                    rho = 0.5 * lr
-                    dA = -rho * matrix_scale * dA_step
-                    dB = -rho * matrix_scale * dB_factor_step.mT
-                    decay = math.sqrt(1.0 - lr * weight_decay)
-                    A_next = decay * A_fp32 + dA / decay
-                    B_next = decay * B_fp32 + dB / decay
-                    if should_rebalance:
-                        sigma_A = _power_iteration(A_next).clamp_min(gauge_rebalance_eps)
-                        sigma_B = _power_iteration(B_next).clamp_min(gauge_rebalance_eps)
-                        scale = torch.pow(torch.sqrt(sigma_B / sigma_A), gauge_rebalance_alpha)
-                        if torch.isfinite(scale):
-                            A_next = A_next * scale
-                            B_next = B_next / scale
-                            mA.div_(scale.to(device=mA.device, dtype=mA.dtype))
-                            mB.mul_(scale.to(device=mB.device, dtype=mB.dtype))
+                        A_fp32 = A.detach().to(torch.float32)
+                        B_fp32 = B.detach().to(torch.float32)
+                        B_factor_fp32 = B_fp32.mT
+                        matrix_scale = math.sqrt(float(A.shape[-2]) / float(B.shape[-1]))
+                        dA_step, dB_factor_step = _dualize_lora_muon_pair(
+                            grad_A=eff_gA,
+                            grad_B=eff_gB.mT,
+                            A=A_fp32,
+                            B=B_factor_fp32,
+                            ns_steps=ns_steps,
+                            inv_eps=inv_eps,
+                            inv_scale=inv_scale,
+                        )
+                        rho = 0.5 * lr
+                        dA = -rho * matrix_scale * dA_step
+                        dB = -rho * matrix_scale * dB_factor_step.mT
+                        decay = math.sqrt(1.0 - lr * weight_decay)
+                        A_next = decay * A_fp32 + dA / decay
+                        B_next = decay * B_fp32 + dB / decay
+                        if should_rebalance:
+                            sigma_A = _power_iteration(A_next).clamp_min(gauge_rebalance_eps)
+                            sigma_B = _power_iteration(B_next).clamp_min(gauge_rebalance_eps)
+                            scale = torch.pow(torch.sqrt(sigma_B / sigma_A), gauge_rebalance_alpha)
+                            if torch.isfinite(scale):
+                                A_next = A_next * scale
+                                B_next = B_next / scale
+                                mA.div_(scale.to(device=mA.device, dtype=mA.dtype))
+                                mB.mul_(scale.to(device=mB.device, dtype=mB.dtype))
 
-                    A_delta = A_next - A_fp32
-                    B_delta = B_next - B_fp32
+                        A_delta = A_next - A_fp32
+                        B_delta = B_next - B_fp32
 
-                    updates_flat[curr : curr + A.numel()] = A_delta.reshape(-1)
-                    updates_flat[curr + A.numel() : curr + pair_numel] = B_delta.reshape(-1)
-                curr += pair_numel
+                        updates_flat[curr : curr + A.numel()] = A_delta.reshape(-1)
+                        updates_flat[curr + A.numel() : curr + pair_numel] = B_delta.reshape(-1)
+                    curr += pair_numel
 
-            if distributed:
-                dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
+            with nvtx_range("lora_muon.all_reduce"):
+                if distributed:
+                    dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
 
-            curr = 0
-            for p in params:
-                delta = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
-                p.add_(delta)
-                curr += p.numel()
+            with nvtx_range("lora_muon.apply"):
+                curr = 0
+                for p in params:
+                    delta = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
+                    p.add_(delta)
+                    curr += p.numel()
 
         self._step_count = next_step_count
         return loss
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
+    def __init__(
+        self,
+        params,
+        lr: float,
+        momentum: float,
+        backend_steps: int,
+        nesterov: bool = True,
+        weight_decay: float = 0.0,
+    ):
         super().__init__(
             params,
-            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
+            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov, weight_decay=weight_decay),
         )
 
     @torch.no_grad()
@@ -473,34 +513,42 @@ class Muon(torch.optim.Optimizer):
             momentum = float(group["momentum"])
             backend_steps = int(group["backend_steps"])
             nesterov = bool(group["nesterov"])
+            weight_decay = float(group["weight_decay"])
+            if weight_decay != 0.0 and lr * weight_decay >= 1.0:
+                raise ValueError("Muon decoupled weight decay requires lr * weight_decay < 1.")
 
-            total_params = sum(int(p.numel()) for p in params)
-            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
+            with nvtx_range("muon.transform"):
+                total_params = sum(int(p.numel()) for p in params)
+                updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
 
-            curr = 0
-            for i, p in enumerate(params):
-                if i % world_size == rank and p.grad is not None:
-                    g = p.grad
-                    state = self.state[p]
-                    if "momentum_buffer" not in state:
-                        state["momentum_buffer"] = torch.zeros_like(g)
-                    buf = state["momentum_buffer"]
-                    buf.mul_(momentum).add_(g)
-                    if nesterov:
-                        g = g.add(buf, alpha=momentum)
-                    g = _orthogonalize(g, steps=backend_steps)
-                    g *= max(1, g.size(0) / g.size(1)) ** 0.5
-                    updates_flat[curr : curr + p.numel()] = g.reshape(-1)
-                curr += p.numel()
+                curr = 0
+                for i, p in enumerate(params):
+                    if i % world_size == rank and p.grad is not None:
+                        g = p.grad
+                        state = self.state[p]
+                        if "momentum_buffer" not in state:
+                            state["momentum_buffer"] = torch.zeros_like(g)
+                        buf = state["momentum_buffer"]
+                        buf.mul_(momentum).add_(g)
+                        if nesterov:
+                            g = g.add(buf, alpha=momentum)
+                        g = _orthogonalize(g, steps=backend_steps)
+                        g *= max(1, g.size(0) / g.size(1)) ** 0.5
+                        updates_flat[curr : curr + p.numel()] = g.reshape(-1)
+                    curr += p.numel()
 
-            if distributed:
-                dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
+            with nvtx_range("muon.all_reduce"):
+                if distributed:
+                    dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
 
-            curr = 0
-            for p in params:
-                delta = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
-                p.add_(delta, alpha=-lr)
-                curr += p.numel()
+            with nvtx_range("muon.apply"):
+                curr = 0
+                for p in params:
+                    if weight_decay != 0.0:
+                        p.mul_(1.0 - lr * weight_decay)
+                    delta = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
+                    p.add_(delta, alpha=-lr)
+                    curr += p.numel()
 
         return loss
 
@@ -964,25 +1012,32 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
-        q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
-        k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        q = F.rms_norm(q, (q.size(-1),))
-        k = F.rms_norm(k, (k.size(-1),))
-        cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        q = apply_rotary_emb(q, cos, sin)
-        k = apply_rotary_emb(k, cos, sin)
-        q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
-        )
-        y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
-        return self.proj(y)
+        with nvtx_range("attn.q_proj"):
+            q = self.c_q(x).reshape(bsz, seqlen, self.num_heads, self.head_dim).transpose(1, 2)
+        with nvtx_range("attn.k_proj"):
+            k = self.c_k(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        with nvtx_range("attn.v_proj"):
+            v = self.c_v(x).reshape(bsz, seqlen, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        with nvtx_range("attn.qk_norm"):
+            q = F.rms_norm(q, (q.size(-1),))
+            k = F.rms_norm(k, (k.size(-1),))
+        with nvtx_range("attn.rope"):
+            cos, sin = self.rotary(seqlen, x.device, q.dtype)
+            q = apply_rotary_emb(q, cos, sin)
+            k = apply_rotary_emb(k, cos, sin)
+            q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
+        with nvtx_range("attn.sdpa"):
+            y = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=None,
+                is_causal=True,
+                enable_gqa=(self.num_kv_heads != self.num_heads),
+            )
+        with nvtx_range("attn.out_proj"):
+            y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
+            return self.proj(y)
 
 
 class MLP(nn.Module):
@@ -998,8 +1053,12 @@ class MLP(nn.Module):
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
-        return self.proj(x.square())
+        with nvtx_range("mlp.fc"):
+            x = self.fc(x)
+        with nvtx_range("mlp.relu_square"):
+            x = torch.relu(x).square()
+        with nvtx_range("mlp.proj"):
+            return self.proj(x)
 
 
 class Block(nn.Module):
@@ -1024,11 +1083,14 @@ class Block(nn.Module):
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
-        mix = self.resid_mix.to(dtype=x.dtype)
-        x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        with nvtx_range("block.resid_mix"):
+            mix = self.resid_mix.to(dtype=x.dtype)
+            x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        with nvtx_range("block.attn"):
+            attn_out = self.attn(self.attn_norm(x))
+            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+        with nvtx_range("block.mlp"):
+            x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -1091,30 +1153,41 @@ class GPT(nn.Module):
                 nn.init.zeros_(module.weight)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        x = self.tok_emb(input_ids)
-        x = F.rms_norm(x, (x.size(-1),))
+        with nvtx_range("model.tok_emb"):
+            x = self.tok_emb(input_ids)
+        with nvtx_range("model.embed_norm"):
+            x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
 
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
-            skips.append(x)
+            with nvtx_range(f"model.encoder_block_{i}"):
+                x = self.blocks[i](x, x0)
+            with nvtx_range(f"model.encoder_skip_store_{i}"):
+                skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+                with nvtx_range(f"model.decoder_skip_add_{i}"):
+                    x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            with nvtx_range(f"model.decoder_block_{i}"):
+                x = self.blocks[self.num_encoder_layers + i](x, x0)
 
-        x = self.final_norm(x).reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
-        if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
-        else:
-            if self.lm_head is None:
-                raise RuntimeError("lm_head is required when tie_embeddings=False")
-            logits_proj = self.lm_head(x)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        with nvtx_range("model.final_norm"):
+            x = self.final_norm(x).reshape(-1, x.size(-1))
+        with nvtx_range("model.targets"):
+            targets = target_ids.reshape(-1)
+        with nvtx_range("model.logits_proj"):
+            if self.tie_embeddings:
+                logits_proj = F.linear(x, self.tok_emb.weight)
+            else:
+                if self.lm_head is None:
+                    raise RuntimeError("lm_head is required when tie_embeddings=False")
+                logits_proj = self.lm_head(x)
+        with nvtx_range("model.logits_softcap"):
+            logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        with nvtx_range("model.loss"):
+            return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
 # -----------------------------
@@ -1236,15 +1309,18 @@ def main() -> None:
         if isinstance(module, (CastedLoRALinear, CastedLinear)):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
-    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    use_detailed_nsight_labels = args.enable_nsight_profile and args.nsight_detailed_labels
+    model_body: nn.Module = (
+        base_model if use_detailed_nsight_labels else torch.compile(base_model, dynamic=False, fullgraph=True)
+    )
+    model: nn.Module = DDP(model_body, device_ids=[local_rank], broadcast_buffers=False) if distributed else model_body
 
     # Optimizer split:
-    # - token embedding (Adam) uses EMBED_LR
-    # - untied dense lm_head (Adam) uses HEAD_LR
+    # - token embedding (AdamW) uses EMBED_LR
+    # - untied dense lm_head (AdamW) uses HEAD_LR
     # - transformer dense matrices use MATRIX_LR via Muon when LoRA is disabled
     # - transformer LoRA factors use MATRIX_LR via LoRA-Muon when LoRA is enabled
-    # - vectors/scalars use SCALAR_LR via Adam
+    # - vectors/scalars use SCALAR_LR via AdamW
     block_named_params = list(base_model.blocks.named_parameters())
     if args.enable_lora:
         lora_pair_slots: dict[str, dict[str, nn.Parameter]] = {}
@@ -1278,10 +1354,11 @@ def main() -> None:
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
-    optimizer_tok = torch.optim.Adam(
+    optimizer_tok = torch.optim.AdamW(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
+        weight_decay=args.weight_decay,
         fused=True,
     )
     if args.enable_lora:
@@ -1292,6 +1369,7 @@ def main() -> None:
             backend_steps=args.muon_backend_steps,
             inv_eps=args.lora_inv_eps,
             inv_scale=args.lora_inv_scale,
+            weight_decay=args.weight_decay,
             enable_gauge_rebalance=args.enable_gauge_rebalance,
             gauge_rebalance_interval=args.gauge_rebalance_interval,
             gauge_rebalance_alpha=args.gauge_rebalance_alpha,
@@ -1303,24 +1381,32 @@ def main() -> None:
             lr=args.matrix_lr,
             momentum=args.muon_momentum,
             backend_steps=args.muon_backend_steps,
+            weight_decay=args.weight_decay,
         )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
-    optimizer_scalar = torch.optim.Adam(
+    optimizer_scalar = torch.optim.AdamW(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
+        weight_decay=args.weight_decay,
         fused=True,
     )
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    named_optimizers: list[tuple[str, torch.optim.Optimizer]] = [
+        ("tok_adam", optimizer_tok),
+        ("muon", optimizer_muon),
+        ("scalar_adam", optimizer_scalar),
+    ]
     if base_model.lm_head is not None:
-        optimizer_head = torch.optim.Adam(
+        optimizer_head = torch.optim.AdamW(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
             betas=(args.beta1, args.beta2),
             eps=args.adam_eps,
+            weight_decay=args.weight_decay,
             fused=True,
         )
-        optimizers.insert(1, optimizer_head)
+        named_optimizers.insert(1, ("head_adam", optimizer_head))
+    optimizers = [opt for _, opt in named_optimizers]
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
@@ -1330,7 +1416,7 @@ def main() -> None:
     log0(
         f"tie_embeddings:{args.tie_embeddings} enable_lora:{args.enable_lora} lora_rank:{args.lora_rank} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
-        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
+        f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr} weight_decay:{args.weight_decay}"
     )
     if args.enable_lora:
         log0(
@@ -1344,6 +1430,7 @@ def main() -> None:
     )
     if args.enable_nsight_profile:
         log0(f"nsight_profile:True start_step:{args.nsight_profile_start_step} steps:{args.nsight_profile_steps}")
+        log0(f"nsight_detailed_labels:{args.nsight_detailed_labels} model_compile:{not use_detailed_nsight_labels}")
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1375,7 +1462,7 @@ def main() -> None:
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
-    # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
+    # Warmup primes the selected forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
     if args.warmup_steps > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
@@ -1452,32 +1539,52 @@ def main() -> None:
         nsight_profiler.step_start(step)
         nsight_profiler.push(f"train_step_{step}")
         try:
+            nsight_profiler.push("zero_grad_pre")
             zero_grad_all()
+            nsight_profiler.pop()
             train_loss = torch.zeros((), device=device)
             for micro_step in range(grad_accum_steps):
+                nsight_profiler.push(f"microstep_{micro_step}")
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+                nsight_profiler.push("data")
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                nsight_profiler.pop()
+                nsight_profiler.push("forward")
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     loss = model(x, y)
+                nsight_profiler.pop()
                 train_loss += loss.detach()
+                nsight_profiler.push("backward")
                 (loss * grad_scale).backward()
+                nsight_profiler.pop()
+                nsight_profiler.pop()
             train_loss /= grad_accum_steps
 
+            nsight_profiler.push("muon_momentum_schedule")
             frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
             muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
             for group in optimizer_muon.param_groups:
                 group["momentum"] = muon_momentum
+            nsight_profiler.pop()
 
+            nsight_profiler.push("lr_schedule")
             for opt in optimizers:
                 for group in opt.param_groups:
                     group["lr"] = group["base_lr"] * scale
+            nsight_profiler.pop()
 
             if args.grad_clip_norm > 0:
+                nsight_profiler.push("grad_clip")
                 torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
-            for opt in optimizers:
+                nsight_profiler.pop()
+            for opt_name, opt in named_optimizers:
+                nsight_profiler.push(f"optimizer.{opt_name}")
                 opt.step()
+                nsight_profiler.pop()
+            nsight_profiler.push("zero_grad_post")
             zero_grad_all()
+            nsight_profiler.pop()
         finally:
             nsight_profiler.pop()
 
