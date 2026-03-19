@@ -89,6 +89,9 @@ class Hyperparameters:
     gauge_rebalance_interval = int(os.environ.get("GAUGE_REBALANCE_INTERVAL", 128))
     gauge_rebalance_alpha = float(os.environ.get("GAUGE_REBALANCE_ALPHA", 0.1))
     gauge_rebalance_eps = float(os.environ.get("GAUGE_REBALANCE_EPS", 1e-12))
+    enable_nsight_profile = bool(int(os.environ.get("ENABLE_NSIGHT_PROFILE", "0")))
+    nsight_profile_start_step = int(os.environ.get("NSIGHT_PROFILE_START_STEP", 10))
+    nsight_profile_steps = int(os.environ.get("NSIGHT_PROFILE_STEPS", 1))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -177,8 +180,9 @@ def matrix_invroot(
     s: int = 1,
     steps: int | None = None,
     eps: float = 1e-6,
-    scale: float = 1.001,
+    scale: float = 1.01,
 ) -> Tensor:
+    assert r == 2, "only r=2 is currently supported for the speedrun"
     r = _supported_root_or_raise(r)
     if s < 0:
         raise ValueError("matrix_invroot expects s >= 0.")
@@ -197,8 +201,10 @@ def matrix_invroot(
     out = eye.expand(P.shape).clone()
     for a, b, c in _abc(r=r, steps=steps, scale=scale):
         W = a * eye + b * Pn + c * (Pn @ Pn)
-        W1 = torch.linalg.matrix_power(W, s)
-        W2 = torch.linalg.matrix_power(W, r)
+        # W1 = torch.linalg.matrix_power(W, s)
+        # W2 = torch.linalg.matrix_power(W, r)
+        W1 = W
+        W2 = W @ W
         out = out @ W1
         Pn = _sym(Pn @ W2)
 
@@ -248,6 +254,40 @@ def _power_iteration(
         v = v / torch.linalg.vector_norm(v, dim=-1, keepdim=True).clamp_min(eps)
 
     return torch.linalg.vector_norm((M @ v.unsqueeze(-1)).squeeze(-1), dim=-1)
+
+
+class NsightProfiler:
+    def __init__(self, *, enabled: bool, start_step: int, num_steps: int, distributed: bool) -> None:
+        self.enabled = enabled and num_steps > 0
+        self.start_step = max(start_step, 0)
+        self.stop_step = self.start_step + max(num_steps, 0)
+        self.distributed = distributed
+        self.active = False
+
+    def _sync(self) -> None:
+        torch.cuda.synchronize()
+        if self.distributed:
+            dist.barrier()
+
+    def step_start(self, step: int) -> None:
+        if self.enabled and not self.active and step == self.start_step:
+            self._sync()
+            torch.cuda.cudart().cudaProfilerStart()
+            self.active = True
+
+    def step_end(self, step: int) -> None:
+        if self.active and step >= self.stop_step:
+            self._sync()
+            torch.cuda.cudart().cudaProfilerStop()
+            self.active = False
+
+    def push(self, name: str) -> None:
+        if self.active:
+            torch.cuda.nvtx.range_push(name)
+
+    def pop(self) -> None:
+        if self.active:
+            torch.cuda.nvtx.range_pop()
 
 
 class LoRAMuon(torch.optim.Optimizer):
@@ -1295,6 +1335,8 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    if args.enable_nsight_profile:
+        log0(f"nsight_profile:True start_step:{args.nsight_profile_start_step} steps:{args.nsight_profile_steps}")
     log0(f"seed:{args.seed}")
 
     # -----------------------------
@@ -1308,6 +1350,12 @@ def main() -> None:
             opt.zero_grad(set_to_none=True)
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
+    nsight_profiler = NsightProfiler(
+        enabled=args.enable_nsight_profile,
+        start_step=args.nsight_profile_start_step,
+        num_steps=args.nsight_profile_steps,
+        distributed=distributed,
+    )
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
         if args.warmdown_iters <= 0:
@@ -1394,34 +1442,40 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
-        zero_grad_all()
-        train_loss = torch.zeros((), device=device)
-        for micro_step in range(grad_accum_steps):
-            if distributed:
-                model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                loss = model(x, y)
-            train_loss += loss.detach()
-            (loss * grad_scale).backward()
-        train_loss /= grad_accum_steps
+        nsight_profiler.step_start(step)
+        nsight_profiler.push(f"train_step_{step}")
+        try:
+            zero_grad_all()
+            train_loss = torch.zeros((), device=device)
+            for micro_step in range(grad_accum_steps):
+                if distributed:
+                    model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    loss = model(x, y)
+                train_loss += loss.detach()
+                (loss * grad_scale).backward()
+            train_loss /= grad_accum_steps
 
-        frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
-        muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
-        for group in optimizer_muon.param_groups:
-            group["momentum"] = muon_momentum
+            frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
+            muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
+            for group in optimizer_muon.param_groups:
+                group["momentum"] = muon_momentum
 
-        for opt in optimizers:
-            for group in opt.param_groups:
-                group["lr"] = group["base_lr"] * scale
+            for opt in optimizers:
+                for group in opt.param_groups:
+                    group["lr"] = group["base_lr"] * scale
 
-        if args.grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
-        for opt in optimizers:
-            opt.step()
-        zero_grad_all()
+            if args.grad_clip_norm > 0:
+                torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+            for opt in optimizers:
+                opt.step()
+            zero_grad_all()
+        finally:
+            nsight_profiler.pop()
 
         step += 1
+        nsight_profiler.step_end(step)
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         should_log_train = (
             args.train_log_every > 0
@@ -1441,6 +1495,8 @@ def main() -> None:
             reached_cap = bool(reached_cap_tensor.item())
         if stop_after_step is None and reached_cap:
             stop_after_step = step
+
+    nsight_profiler.step_end(step + max(args.nsight_profile_steps, 1))
 
     log0(
         f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
