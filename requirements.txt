@@ -1,4 +1,6 @@
 numpy
+scipy
+matplotlib
 tqdm
 torch==2.10
 huggingface-hub
