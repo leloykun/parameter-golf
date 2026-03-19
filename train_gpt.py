@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 import uuid
+import weakref
 import zlib
 from pathlib import Path
 
@@ -140,12 +141,12 @@ NTH_ROOT_COEFFS: list[list[tuple[float, float, float]] | None] = [
 ]
 
 
-def _orthogonalize(M: Tensor, steps: int) -> Tensor:
+def _orthogonalize(M: Tensor, steps: int, eps: float = 1e-7) -> Tensor:
     X = M.bfloat16()
-    transposed = X.shape[0] > X.shape[1]
+    X = X / (X.norm() + eps)
+    transposed = X.size(0) > X.size(1)
     if transposed:
         X = X.mT
-    X = X / (X.norm() + 1e-7)
     for a, b, c in MUON_NS_COEFFS[:steps]:
         A = X @ X.mT
         B = b * A + c * (A @ A)
@@ -188,28 +189,30 @@ def matrix_invroot(
         raise ValueError("matrix_invroot expects s >= 0.")
     if P.ndim < 2 or P.shape[-1] != P.shape[-2]:
         raise ValueError("matrix_invroot expects shape (..., N, N).")
+    P = P.to(torch.bfloat16)
 
     n = P.shape[-1]
     eye = torch.eye(n, device=P.device, dtype=P.dtype)
     if P.ndim > 2:
         eye = eye.view((1,) * (P.ndim - 2) + (n, n))
 
-    frob = torch.linalg.matrix_norm(P, ord="fro", dim=(-2, -1), keepdim=True)
+    frob = torch.linalg.matrix_norm(P.to(torch.float32), ord="fro", dim=(-2, -1), keepdim=True)
     frob_safe = torch.where(frob > eps, frob, torch.ones_like(frob))
 
-    Pn = P / frob_safe + eps * eye
+    Pn = (P / frob_safe.to(dtype=P.dtype) + eps * eye).to(dtype=P.dtype)
     out = eye.expand(P.shape).clone()
     for a, b, c in _abc(r=r, steps=steps, scale=scale):
-        W = a * eye + b * Pn + c * (Pn @ Pn)
-        # W1 = torch.linalg.matrix_power(W, s)
-        # W2 = torch.linalg.matrix_power(W, r)
+        a_t = P.new_tensor(a)
+        b_t = P.new_tensor(b)
+        c_t = P.new_tensor(c)
+        W = a_t * eye + b_t * Pn + c_t * (Pn @ Pn)
         W1 = W
         W2 = W @ W
         out = out @ W1
         Pn = _sym(Pn @ W2)
 
     factor = torch.where(frob > eps, frob ** (-float(s) / float(r)), torch.zeros_like(frob))
-    return out * factor
+    return (out * factor.to(dtype=out.dtype)).to(dtype=P.dtype)
 
 
 def _dualize_lora_muon_pair(
@@ -224,11 +227,12 @@ def _dualize_lora_muon_pair(
 ) -> tuple[Tensor, Tensor]:
     if A.shape[-1] != B.shape[-1]:
         raise RuntimeError(f"LoRA rank mismatch: A.shape={tuple(A.shape)} and B.shape={tuple(B.shape)}")
-    grams = torch.stack((B.mT @ B, A.mT @ A), dim=0).to(torch.bfloat16)
+    grad_A, grad_B, A, B = grad_A.to(torch.bfloat16), grad_B.to(torch.bfloat16), A.to(torch.bfloat16), B.to(torch.bfloat16)
+    grams = torch.stack((B.mT @ B, A.mT @ A), dim=0)
     invroots = matrix_invroot(grams, r=2, steps=ns_steps, eps=inv_eps, scale=inv_scale)
     B_gram_isqrt, A_gram_isqrt = invroots.unbind(dim=0)
-    dA = _orthogonalize(grad_A.to(torch.bfloat16) @ B_gram_isqrt, steps=ns_steps) @ B_gram_isqrt
-    dB = _orthogonalize(grad_B.to(torch.bfloat16) @ A_gram_isqrt, steps=ns_steps) @ A_gram_isqrt
+    dA = _orthogonalize(grad_A @ B_gram_isqrt, steps=ns_steps) @ B_gram_isqrt
+    dB = _orthogonalize(grad_B @ A_gram_isqrt, steps=ns_steps) @ A_gram_isqrt
     return dA, dB
 
 
@@ -299,6 +303,7 @@ class LoRAMuon(torch.optim.Optimizer):
         backend_steps: int,
         inv_eps: float,
         inv_scale: float,
+        nesterov: bool = True,
         weight_decay: float = 0.0,
         enable_gauge_rebalance: bool = True,
         gauge_rebalance_interval: int = 128,
@@ -319,6 +324,7 @@ class LoRAMuon(torch.optim.Optimizer):
                 backend_steps=backend_steps,
                 inv_eps=inv_eps,
                 inv_scale=inv_scale,
+                nesterov=nesterov,
                 weight_decay=weight_decay,
                 enable_gauge_rebalance=enable_gauge_rebalance,
                 gauge_rebalance_interval=gauge_rebalance_interval,
@@ -352,6 +358,7 @@ class LoRAMuon(torch.optim.Optimizer):
             ns_steps = int(group["backend_steps"])
             inv_eps = float(group["inv_eps"])
             inv_scale = float(group["inv_scale"])
+            nesterov = bool(group["nesterov"])
             weight_decay = float(group["weight_decay"])
             enable_gauge_rebalance = bool(group.get("enable_gauge_rebalance", True))
             gauge_rebalance_interval = int(group.get("gauge_rebalance_interval", 128))
@@ -381,32 +388,35 @@ class LoRAMuon(torch.optim.Optimizer):
                     state_A = self.state[A]
                     state_B = self.state[B]
                     if "momentum" not in state_A:
-                        state_A["momentum"] = torch.zeros_like(A, dtype=torch.float32)
+                        state_A["momentum"] = torch.zeros_like(A)
                     if "momentum" not in state_B:
-                        state_B["momentum"] = torch.zeros_like(B, dtype=torch.float32)
+                        state_B["momentum"] = torch.zeros_like(B)
                     mA = state_A["momentum"]
                     mB = state_B["momentum"]
 
-                    gA = A.grad.detach().to(torch.float32)
-                    gB = B.grad.detach().to(torch.float32)
-                    mA_tilde = momentum * mA + (1.0 - momentum) * gA
-                    mB_tilde = momentum * mB + (1.0 - momentum) * gB
+                    gA = A.grad.detach()
+                    gB = B.grad.detach()
+                    mA.mul_(momentum).add_(gA)
+                    mB.mul_(momentum).add_(gB)
+                    eff_gA = gA.add(mA, alpha=momentum) if nesterov else mA
+                    eff_gB = gB.add(mB, alpha=momentum) if nesterov else mB
 
                     A_fp32 = A.detach().to(torch.float32)
                     B_fp32 = B.detach().to(torch.float32)
-                    matrix_scale = math.sqrt(float(A.shape[-2]) / float(B.shape[-2]))
-                    dA_step, dB_step = _dualize_lora_muon_pair(
-                        grad_A=mA_tilde,
-                        grad_B=mB_tilde,
+                    B_factor_fp32 = B_fp32.mT
+                    matrix_scale = math.sqrt(float(A.shape[-2]) / float(B.shape[-1]))
+                    dA_step, dB_factor_step = _dualize_lora_muon_pair(
+                        grad_A=eff_gA,
+                        grad_B=eff_gB.mT,
                         A=A_fp32,
-                        B=B_fp32,
+                        B=B_factor_fp32,
                         ns_steps=ns_steps,
                         inv_eps=inv_eps,
                         inv_scale=inv_scale,
                     )
                     rho = 0.5 * lr
                     dA = -rho * matrix_scale * dA_step
-                    dB = -rho * matrix_scale * dB_step
+                    dB = -rho * matrix_scale * dB_factor_step.mT
                     decay = math.sqrt(1.0 - lr * weight_decay)
                     A_next = decay * A_fp32 + dA / decay
                     B_next = decay * B_fp32 + dB / decay
@@ -417,26 +427,35 @@ class LoRAMuon(torch.optim.Optimizer):
                         if torch.isfinite(scale):
                             A_next = A_next * scale
                             B_next = B_next / scale
-                            mA_tilde = mA_tilde / scale
-                            mB_tilde = mB_tilde * scale
+                            mA.div_(scale.to(device=mA.device, dtype=mA.dtype))
+                            mB.mul_(scale.to(device=mB.device, dtype=mB.dtype))
 
                     A_delta = A_next - A_fp32
                     B_delta = B_next - B_fp32
 
                     updates_flat[curr : curr + A.numel()] = A_delta.reshape(-1)
                     updates_flat[curr + A.numel() : curr + pair_numel] = B_delta.reshape(-1)
-                    mA.copy_(mA_tilde)
-                    mB.copy_(mB_tilde)
                 curr += pair_numel
 
             if distributed:
                 dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
 
             curr = 0
-            for p in params:
-                delta = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
-                p.add_(delta)
-                curr += p.numel()
+            for pair_idx in range(0, len(params), 2):
+                A = params[pair_idx]
+                B = params[pair_idx + 1]
+                pair_numel = int(A.numel() + B.numel())
+                A_delta = updates_flat[curr : curr + A.numel()].view_as(A).to(dtype=A.dtype)
+                B_delta = updates_flat[curr + A.numel() : curr + pair_numel].view_as(B).to(dtype=B.dtype)
+                A.add_(A_delta)
+                B.add_(B_delta)
+                owner_ref = getattr(A, "_casted_owner_ref", None)
+                if owner_ref is None:
+                    owner_ref = getattr(B, "_casted_owner_ref", None)
+                owner = owner_ref() if owner_ref is not None else None
+                if owner is not None:
+                    owner.refresh_compute_weights()
+                curr += pair_numel
 
         self._step_count = next_step_count
         return loss
@@ -475,13 +494,14 @@ class Muon(torch.optim.Optimizer):
             curr = 0
             for i, p in enumerate(params):
                 if i % world_size == rank and p.grad is not None:
-                    g = p.grad.detach().to(torch.float32)
+                    g = p.grad
                     state = self.state[p]
                     if "momentum_buffer" not in state:
                         state["momentum_buffer"] = torch.zeros_like(g)
                     buf = state["momentum_buffer"]
                     buf.mul_(momentum).add_(g)
-                    g = g.add(buf, alpha=momentum) if nesterov else buf
+                    if nesterov:
+                        g = g.add(buf, alpha=momentum)
                     g = _orthogonalize(g, steps=backend_steps)
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
                     updates_flat[curr : curr + p.numel()] = g.reshape(-1)
@@ -846,6 +866,7 @@ class CastedLinear(nn.Linear):
 
 class CastedLoRALinear(nn.Module):
     # Store LoRA factors in fp32 for optimizer quality, but execute the matmuls in bf16.
+    # Keep lora_B in [rank, in_features] layout so the first F.linear can use it directly.
     def __init__(self, in_features: int, out_features: int, rank: int):
         super().__init__()
         if rank <= 0:
@@ -858,7 +879,12 @@ class CastedLoRALinear(nn.Module):
         self.out_features = out_features
         self.rank = rank
         self.lora_A = nn.Parameter(torch.empty(out_features, rank))
-        self.lora_B = nn.Parameter(torch.empty(in_features, rank))
+        self.lora_B = nn.Parameter(torch.empty(rank, in_features))
+        self.register_buffer("_lora_A_bf16", torch.empty(out_features, rank, dtype=torch.bfloat16), persistent=False)
+        self.register_buffer("_lora_B_bf16", torch.empty(rank, in_features, dtype=torch.bfloat16), persistent=False)
+        owner_ref = weakref.ref(self)
+        self.lora_A._casted_owner_ref = owner_ref
+        self.lora_B._casted_owner_ref = owner_ref
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -869,17 +895,48 @@ class CastedLoRALinear(nn.Module):
             factor_scale = math.sqrt(matrix_scale)
             self.lora_A.copy_(factor_scale * _orthogonalize(self.lora_A, steps=len(MUON_NS_COEFFS)))
             self.lora_B.copy_(factor_scale * _orthogonalize(self.lora_B, steps=len(MUON_NS_COEFFS)))
+        self.refresh_compute_weights()
+
+    @torch.no_grad()
+    def refresh_compute_weights(self) -> None:
+        if (
+            self._lora_A_bf16.shape != self.lora_A.shape
+            or self._lora_A_bf16.device != self.lora_A.device
+            or self._lora_A_bf16.dtype != torch.bfloat16
+        ):
+            self._lora_A_bf16 = torch.empty_like(self.lora_A, dtype=torch.bfloat16, device=self.lora_A.device)
+        if (
+            self._lora_B_bf16.shape != self.lora_B.shape
+            or self._lora_B_bf16.device != self.lora_B.device
+            or self._lora_B_bf16.dtype != torch.bfloat16
+        ):
+            self._lora_B_bf16 = torch.empty_like(self.lora_B, dtype=torch.bfloat16, device=self.lora_B.device)
+        self._lora_A_bf16.copy_(self.lora_A, non_blocking=True)
+        self._lora_B_bf16.copy_(self.lora_B, non_blocking=True)
+
+    def _apply(self, fn):
+        super()._apply(fn)
+        self.refresh_compute_weights()
+        return self
+
+    def _load_from_state_dict(self, *args, **kwargs):
+        super()._load_from_state_dict(*args, **kwargs)
+        self.refresh_compute_weights()
 
     def shrink_effective_weight(self, divisor: float = 1024.0) -> None:
         if divisor <= 0.0:
             raise ValueError(f"divisor must be positive, got {divisor}")
         with torch.no_grad():
             self.lora_A.div_(divisor)
+            self._lora_A_bf16.copy_(self.lora_A, non_blocking=True)
 
     def forward(self, x: Tensor) -> Tensor:
         compute_dtype = torch.bfloat16 if x.device.type == "cuda" else x.dtype
-        x_compute = x.to(dtype=compute_dtype)
-        hidden = F.linear(x_compute, self.lora_B.to(dtype=compute_dtype).mT)
+        x_compute = x if x.dtype == compute_dtype else x.to(dtype=compute_dtype)
+        if x.device.type == "cuda":
+            hidden = F.linear(x_compute, self._lora_B_bf16)
+            return F.linear(hidden, self._lora_A_bf16)
+        hidden = F.linear(x_compute, self.lora_B.to(dtype=compute_dtype))
         return F.linear(hidden, self.lora_A.to(dtype=compute_dtype))
 
 
