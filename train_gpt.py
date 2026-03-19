@@ -149,6 +149,7 @@ def _orthogonalize(M: Tensor, steps: int, eps: float = 1e-7) -> Tensor:
     if transposed:
         X = X.mT
     for a, b, c in MUON_NS_COEFFS[:steps]:
+        a, b, c = a / 1.01, b / (1.01 ** 3), c / (1.01 ** 5)
         A = X @ X.mT
         B = b * A + c * (A @ A)
         X = a * X + B @ X
@@ -423,10 +424,10 @@ class LoRAMuon(torch.optim.Optimizer):
 
                         gA = A.grad.detach()
                         gB = B.grad.detach()
-                        mA.mul_(momentum).add_(gA)
-                        mB.mul_(momentum).add_(gB)
-                        eff_gA = gA.add(mA, alpha=momentum) if nesterov else mA
-                        eff_gB = gB.add(mB, alpha=momentum) if nesterov else mB
+                        mA.mul_(momentum).add_(gA.mul(1.0 - momentum))
+                        mB.mul_(momentum).add_(gB.mul(1.0 - momentum))
+                        eff_gA = mA * momentum + gA * (1.0 - momentum) if nesterov else mA
+                        eff_gB = mB * momentum + gB * (1.0 - momentum) if nesterov else mB
 
                         A_fp32 = A.detach().to(torch.float32)
                         B_fp32 = B.detach().to(torch.float32)
@@ -529,11 +530,10 @@ class Muon(torch.optim.Optimizer):
                         if "momentum_buffer" not in state:
                             state["momentum_buffer"] = torch.zeros_like(g)
                         buf = state["momentum_buffer"]
-                        buf.mul_(momentum).add_(g)
-                        if nesterov:
-                            g = g.add(buf, alpha=momentum)
+                        buf.mul_(momentum).add_(g.mul(1.0 - momentum))
+                        g = buf * momentum + g * (1.0 - momentum) if nesterov else buf
                         g = _orthogonalize(g, steps=backend_steps)
-                        g *= max(1, g.size(0) / g.size(1)) ** 0.5
+                        g *= (g.size(0) / g.size(1)) ** 0.5
                         updates_flat[curr : curr + p.numel()] = g.reshape(-1)
                     curr += p.numel()
 
@@ -1025,8 +1025,8 @@ class CausalSelfAttention(nn.Module):
             cos, sin = self.rotary(seqlen, x.device, q.dtype)
             q = apply_rotary_emb(q, cos, sin)
             k = apply_rotary_emb(k, cos, sin)
-            q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         with nvtx_range("attn.sdpa"):
+            q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
             y = F.scaled_dot_product_attention(
                 q,
                 k,
