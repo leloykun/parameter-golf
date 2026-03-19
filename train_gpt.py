@@ -16,7 +16,6 @@ import subprocess
 import sys
 import time
 import uuid
-import weakref
 import zlib
 from pathlib import Path
 
@@ -441,21 +440,10 @@ class LoRAMuon(torch.optim.Optimizer):
                 dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
 
             curr = 0
-            for pair_idx in range(0, len(params), 2):
-                A = params[pair_idx]
-                B = params[pair_idx + 1]
-                pair_numel = int(A.numel() + B.numel())
-                A_delta = updates_flat[curr : curr + A.numel()].view_as(A).to(dtype=A.dtype)
-                B_delta = updates_flat[curr + A.numel() : curr + pair_numel].view_as(B).to(dtype=B.dtype)
-                A.add_(A_delta)
-                B.add_(B_delta)
-                owner_ref = getattr(A, "_casted_owner_ref", None)
-                if owner_ref is None:
-                    owner_ref = getattr(B, "_casted_owner_ref", None)
-                owner = owner_ref() if owner_ref is not None else None
-                if owner is not None:
-                    owner.refresh_compute_weights()
-                curr += pair_numel
+            for p in params:
+                delta = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
+                p.add_(delta)
+                curr += p.numel()
 
         self._step_count = next_step_count
         return loss
@@ -880,11 +868,6 @@ class CastedLoRALinear(nn.Module):
         self.rank = rank
         self.lora_A = nn.Parameter(torch.empty(out_features, rank))
         self.lora_B = nn.Parameter(torch.empty(rank, in_features))
-        self.register_buffer("_lora_A_bf16", torch.empty(out_features, rank, dtype=torch.bfloat16), persistent=False)
-        self.register_buffer("_lora_B_bf16", torch.empty(rank, in_features, dtype=torch.bfloat16), persistent=False)
-        owner_ref = weakref.ref(self)
-        self.lora_A._casted_owner_ref = owner_ref
-        self.lora_B._casted_owner_ref = owner_ref
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -895,47 +878,16 @@ class CastedLoRALinear(nn.Module):
             factor_scale = math.sqrt(matrix_scale)
             self.lora_A.copy_(factor_scale * _orthogonalize(self.lora_A, steps=len(MUON_NS_COEFFS)))
             self.lora_B.copy_(factor_scale * _orthogonalize(self.lora_B, steps=len(MUON_NS_COEFFS)))
-        self.refresh_compute_weights()
-
-    @torch.no_grad()
-    def refresh_compute_weights(self) -> None:
-        if (
-            self._lora_A_bf16.shape != self.lora_A.shape
-            or self._lora_A_bf16.device != self.lora_A.device
-            or self._lora_A_bf16.dtype != torch.bfloat16
-        ):
-            self._lora_A_bf16 = torch.empty_like(self.lora_A, dtype=torch.bfloat16, device=self.lora_A.device)
-        if (
-            self._lora_B_bf16.shape != self.lora_B.shape
-            or self._lora_B_bf16.device != self.lora_B.device
-            or self._lora_B_bf16.dtype != torch.bfloat16
-        ):
-            self._lora_B_bf16 = torch.empty_like(self.lora_B, dtype=torch.bfloat16, device=self.lora_B.device)
-        self._lora_A_bf16.copy_(self.lora_A, non_blocking=True)
-        self._lora_B_bf16.copy_(self.lora_B, non_blocking=True)
-
-    def _apply(self, fn):
-        super()._apply(fn)
-        self.refresh_compute_weights()
-        return self
-
-    def _load_from_state_dict(self, *args, **kwargs):
-        super()._load_from_state_dict(*args, **kwargs)
-        self.refresh_compute_weights()
 
     def shrink_effective_weight(self, divisor: float = 1024.0) -> None:
         if divisor <= 0.0:
             raise ValueError(f"divisor must be positive, got {divisor}")
         with torch.no_grad():
             self.lora_A.div_(divisor)
-            self._lora_A_bf16.copy_(self.lora_A, non_blocking=True)
 
     def forward(self, x: Tensor) -> Tensor:
         compute_dtype = torch.bfloat16 if x.device.type == "cuda" else x.dtype
         x_compute = x if x.dtype == compute_dtype else x.to(dtype=compute_dtype)
-        if x.device.type == "cuda":
-            hidden = F.linear(x_compute, self._lora_B_bf16)
-            return F.linear(hidden, self._lora_A_bf16)
         hidden = F.linear(x_compute, self.lora_B.to(dtype=compute_dtype))
         return F.linear(hidden, self.lora_A.to(dtype=compute_dtype))
 
