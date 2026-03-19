@@ -75,331 +75,38 @@ class Hyperparameters:
     head_lr = float(os.environ.get("HEAD_LR", 0.008))
     tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.05))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    enable_lora = bool(int(os.environ.get("ENABLE_LORA", "0")))
-    lora_rank = int(os.environ.get("LORA_RANK", 128))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
-    muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 8))
+    muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
-    lora_inv_eps = float(os.environ.get("LORA_INV_EPS", 1e-6))
-    lora_inv_scale = float(os.environ.get("LORA_INV_SCALE", 1.001))
-    enable_gauge_rebalance = bool(int(os.environ.get("ENABLE_GAUGE_REBALANCE", "1")))
-    gauge_rebalance_interval = int(os.environ.get("GAUGE_REBALANCE_INTERVAL", 128))
-    gauge_rebalance_alpha = float(os.environ.get("GAUGE_REBALANCE_ALPHA", 0.1))
-    gauge_rebalance_eps = float(os.environ.get("GAUGE_REBALANCE_EPS", 1e-12))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
 # -----------------------------
-# MUON / LORA-MUON
+# MUON OPTIMIZER 
 # -----------------------------
-#
-# This uses the newer Newton-Schulz coefficients from the LoRA-Muon reference
-# implementation, while preserving the existing distributed "one rank owns a
-# parameter transform, then all-reduce the flat update buffer" structure.
+# 
+# As borrowed from modded-nanogpt
+# Background on Muon: https://kellerjordan.github.io/posts/muon/
 
-MUON_NS_COEFFS: list[tuple[float, float, float]] = [
-    (7.2086, -15.5131, 9.0178),
-    (3.9623, -2.5813, 0.4542),
-    (3.9466, -2.5765, 0.4544),
-    (3.8991, -2.5671, 0.4566),
-    (3.7186, -2.5308, 0.4653),
-    (3.1390, -2.3073, 0.4733),
-    (2.1715, -1.5246, 0.3885),
-    (1.8648, -1.2224, 0.3577),
-]
-
-NTH_ROOT_COEFFS: list[list[tuple[float, float, float]] | None] = [
-    None,
-    None,
-    [
-        (7.424865680309214, -18.39581635618996, 12.896720413604342),
-        (3.4877256051546017, -2.3300436563986993, 0.4404692168431095),
-        (2.7766085124882527, -2.070643152532662, 0.46302261050004967),
-        (1.9913142104341506, -1.373936700681269, 0.3875934979568538),
-        (1.8754637749479246, -1.2505152090010534, 0.37505152463617264),
-        (1.874999066623701, -1.2499981332141676, 0.37499906659046633),
-        (1.875, -1.25, 0.375),
-    ],
-    None,
-    [
-        (3.85003181724939, -10.853860241993278, 8.618933773002455),
-        (1.8099210622771318, -0.5877777285425438, 0.06478521007149429),
-        (1.5039396714850155, -0.594515590829229, 0.12116149581658857),
-        (1.4086233134294281, -0.5637769238099195, 0.1551787660660711),
-        (1.4062500496446348, -0.562500027067629, 0.15624997742300542),
-        (1.40625, -0.5625, 0.15625),
-    ],
-]
-
-
-def _orthogonalize(M: Tensor, steps: int) -> Tensor:
-    X = M.bfloat16()
-    transposed = X.shape[0] > X.shape[1]
+def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -> Tensor:
+    # Orthogonalize a 2D update matrix with a fast Newton-Schulz iteration.
+    # Muon uses this to normalize matrix-shaped gradients before applying them.
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    X = G.bfloat16()
+    X /= X.norm() + eps
+    transposed = G.size(0) > G.size(1)
     if transposed:
-        X = X.mT
-    X = X / (X.norm() + 1e-7)
-    for a, b, c in MUON_NS_COEFFS[:steps]:
-        A = X @ X.mT
-        B = b * A + c * (A @ A)
+        X = X.T
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * A @ A
         X = a * X + B @ X
-    return X.mT if transposed else X
-
-
-def _supported_root_or_raise(r: int) -> int:
-    if r <= 0 or r >= len(NTH_ROOT_COEFFS) or NTH_ROOT_COEFFS[r] is None:
-        raise ValueError(f"Unsupported root r={r}. Supported roots: 2 and 4.")
-    return r
-
-
-def _abc(*, r: int, steps: int | None = None, scale: float = 1.0):
-    r = _supported_root_or_raise(r)
-    coeffs = NTH_ROOT_COEFFS[r]
-    assert coeffs is not None
-    n_steps = steps or len(coeffs)
-    padded_coeffs = coeffs[:n_steps] + coeffs[-1:] * max(n_steps - len(coeffs), 0)
-    for a, b, c in padded_coeffs:
-        yield a / scale, b / (scale ** (r + 1)), c / (scale ** (2 * r + 1))
-
-
-def _sym(M: Tensor) -> Tensor:
-    return 0.5 * (M + M.mT)
-
-
-def matrix_invroot(
-    P: Tensor,
-    *,
-    r: int,
-    s: int = 1,
-    steps: int | None = None,
-    eps: float = 1e-6,
-    scale: float = 1.001,
-) -> Tensor:
-    r = _supported_root_or_raise(r)
-    if s < 0:
-        raise ValueError("matrix_invroot expects s >= 0.")
-    if P.ndim < 2 or P.shape[-1] != P.shape[-2]:
-        raise ValueError("matrix_invroot expects shape (..., N, N).")
-
-    n = P.shape[-1]
-    eye = torch.eye(n, device=P.device, dtype=P.dtype)
-    if P.ndim > 2:
-        eye = eye.view((1,) * (P.ndim - 2) + (n, n))
-
-    frob = torch.linalg.matrix_norm(P, ord="fro", dim=(-2, -1), keepdim=True)
-    frob_safe = torch.where(frob > eps, frob, torch.ones_like(frob))
-
-    Pn = P / frob_safe + eps * eye
-    out = eye.expand(P.shape).clone()
-    for a, b, c in _abc(r=r, steps=steps, scale=scale):
-        W = a * eye + b * Pn + c * (Pn @ Pn)
-        W1 = torch.linalg.matrix_power(W, s)
-        W2 = torch.linalg.matrix_power(W, r)
-        out = out @ W1
-        Pn = _sym(Pn @ W2)
-
-    factor = torch.where(frob > eps, frob ** (-float(s) / float(r)), torch.zeros_like(frob))
-    return out * factor
-
-
-def _dualize_lora_muon_pair(
-    grad_A: Tensor,
-    grad_B: Tensor,
-    A: Tensor,
-    B: Tensor,
-    *,
-    ns_steps: int,
-    inv_eps: float,
-    inv_scale: float,
-) -> tuple[Tensor, Tensor]:
-    if A.shape[-1] != B.shape[-1]:
-        raise RuntimeError(f"LoRA rank mismatch: A.shape={tuple(A.shape)} and B.shape={tuple(B.shape)}")
-    grams = torch.stack((B.mT @ B, A.mT @ A), dim=0).to(torch.bfloat16)
-    invroots = matrix_invroot(grams, r=2, steps=ns_steps, eps=inv_eps, scale=inv_scale)
-    B_gram_isqrt, A_gram_isqrt = invroots.unbind(dim=0)
-    dA = _orthogonalize(grad_A.to(torch.bfloat16) @ B_gram_isqrt, steps=ns_steps) @ B_gram_isqrt
-    dB = _orthogonalize(grad_B.to(torch.bfloat16) @ A_gram_isqrt, steps=ns_steps) @ A_gram_isqrt
-    return dA, dB
-
-
-def _power_iteration(
-    M: Tensor,
-    *,
-    n_steps: int = 8,
-    eps: float = 1e-12,
-) -> Tensor:
-    if M.ndim < 2:
-        raise ValueError("Power iteration expects shape (..., M, N).")
-    if M.numel() == 0:
-        return torch.zeros(M.shape[:-2], device=M.device, dtype=M.dtype)
-
-    v = torch.ones((*M.shape[:-2], M.shape[-1]), device=M.device, dtype=M.dtype)
-    v = v / torch.linalg.vector_norm(v, dim=-1, keepdim=True).clamp_min(eps)
-
-    for _ in range(n_steps):
-        u = (M @ v.unsqueeze(-1)).squeeze(-1)
-        u = u / torch.linalg.vector_norm(u, dim=-1, keepdim=True).clamp_min(eps)
-
-        v = (M.mT @ u.unsqueeze(-1)).squeeze(-1)
-        v = v / torch.linalg.vector_norm(v, dim=-1, keepdim=True).clamp_min(eps)
-
-    return torch.linalg.vector_norm((M @ v.unsqueeze(-1)).squeeze(-1), dim=-1)
-
-
-class LoRAMuon(torch.optim.Optimizer):
-    def __init__(
-        self,
-        params,
-        lr: float,
-        momentum: float,
-        backend_steps: int,
-        inv_eps: float,
-        inv_scale: float,
-        weight_decay: float = 0.0,
-        enable_gauge_rebalance: bool = True,
-        gauge_rebalance_interval: int = 128,
-        gauge_rebalance_alpha: float = 0.1,
-        gauge_rebalance_eps: float = 1e-12,
-    ):
-        if gauge_rebalance_interval <= 0:
-            raise ValueError("gauge_rebalance_interval must be > 0.")
-        if not (0.0 < gauge_rebalance_alpha <= 1.0):
-            raise ValueError("gauge_rebalance_alpha must be in (0, 1].")
-        if gauge_rebalance_eps <= 0.0:
-            raise ValueError("gauge_rebalance_eps must be > 0.")
-        super().__init__(
-            params,
-            dict(
-                lr=lr,
-                momentum=momentum,
-                backend_steps=backend_steps,
-                inv_eps=inv_eps,
-                inv_scale=inv_scale,
-                weight_decay=weight_decay,
-                enable_gauge_rebalance=enable_gauge_rebalance,
-                gauge_rebalance_interval=gauge_rebalance_interval,
-                gauge_rebalance_alpha=gauge_rebalance_alpha,
-                gauge_rebalance_eps=gauge_rebalance_eps,
-            ),
-        )
-        for group in self.param_groups:
-            if len(group["params"]) % 2 != 0:
-                raise ValueError("LoRAMuon expects adjacent (A, B) factor parameters.")
-        self._step_count = 0
-
-    @torch.no_grad()
-    def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            with torch.enable_grad():
-                loss = closure()
-
-        distributed = dist.is_available() and dist.is_initialized()
-        world_size = dist.get_world_size() if distributed else 1
-        rank = dist.get_rank() if distributed else 0
-        next_step_count = self._step_count + 1
-
-        for group in self.param_groups:
-            params = group["params"]
-            if not params:
-                continue
-            lr = float(group["lr"])
-            momentum = float(group["momentum"])
-            ns_steps = int(group["backend_steps"])
-            inv_eps = float(group["inv_eps"])
-            inv_scale = float(group["inv_scale"])
-            weight_decay = float(group["weight_decay"])
-            enable_gauge_rebalance = bool(group.get("enable_gauge_rebalance", True))
-            gauge_rebalance_interval = int(group.get("gauge_rebalance_interval", 128))
-            gauge_rebalance_alpha = float(group.get("gauge_rebalance_alpha", 0.1))
-            gauge_rebalance_eps = float(group.get("gauge_rebalance_eps", 1e-12))
-            should_rebalance = enable_gauge_rebalance and (next_step_count % gauge_rebalance_interval == 0)
-            if weight_decay != 0.0 and lr * weight_decay >= 1.0:
-                raise ValueError("LoRA decoupled weight decay requires lr * weight_decay < 1.")
-
-            total_params = sum(int(p.numel()) for p in params)
-            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
-
-            curr = 0
-            for pair_idx in range(0, len(params), 2):
-                A = params[pair_idx]
-                B = params[pair_idx + 1]
-                pair_numel = int(A.numel() + B.numel())
-                # Keep the original Muon ownership model, but assign coupled LoRA
-                # factors to the same rank so the transform can be computed locally.
-                if pair_idx // 2 % world_size == rank:
-                    if A.grad is None and B.grad is None:
-                        curr += pair_numel
-                        continue
-                    if A.grad is None or B.grad is None:
-                        raise RuntimeError("Both LoRA factor gradients must be present.")
-
-                    state_A = self.state[A]
-                    state_B = self.state[B]
-                    if "momentum" not in state_A:
-                        state_A["momentum"] = torch.zeros_like(A, dtype=torch.float32)
-                    if "momentum" not in state_B:
-                        state_B["momentum"] = torch.zeros_like(B, dtype=torch.float32)
-                    mA = state_A["momentum"]
-                    mB = state_B["momentum"]
-
-                    gA = A.grad.detach().to(torch.float32)
-                    gB = B.grad.detach().to(torch.float32)
-                    mA_tilde = momentum * mA + (1.0 - momentum) * gA
-                    mB_tilde = momentum * mB + (1.0 - momentum) * gB
-
-                    A_fp32 = A.detach().to(torch.float32)
-                    B_fp32 = B.detach().to(torch.float32)
-                    matrix_scale = math.sqrt(float(A.shape[-2]) / float(B.shape[-2]))
-                    dA_step, dB_step = _dualize_lora_muon_pair(
-                        grad_A=mA_tilde,
-                        grad_B=mB_tilde,
-                        A=A_fp32,
-                        B=B_fp32,
-                        ns_steps=ns_steps,
-                        inv_eps=inv_eps,
-                        inv_scale=inv_scale,
-                    )
-                    rho = 0.5 * lr
-                    dA = -rho * matrix_scale * dA_step
-                    dB = -rho * matrix_scale * dB_step
-                    decay = math.sqrt(1.0 - lr * weight_decay)
-                    A_next = decay * A_fp32 + dA / decay
-                    B_next = decay * B_fp32 + dB / decay
-                    if should_rebalance:
-                        sigma_A = _power_iteration(A_next).clamp_min(gauge_rebalance_eps)
-                        sigma_B = _power_iteration(B_next).clamp_min(gauge_rebalance_eps)
-                        scale = torch.pow(torch.sqrt(sigma_B / sigma_A), gauge_rebalance_alpha)
-                        if torch.isfinite(scale):
-                            A_next = A_next * scale
-                            B_next = B_next / scale
-                            mA_tilde = mA_tilde / scale
-                            mB_tilde = mB_tilde * scale
-
-                    A_delta = A_next - A_fp32
-                    B_delta = B_next - B_fp32
-
-                    updates_flat[curr : curr + A.numel()] = A_delta.reshape(-1)
-                    updates_flat[curr + A.numel() : curr + pair_numel] = B_delta.reshape(-1)
-                    mA.copy_(mA_tilde)
-                    mB.copy_(mB_tilde)
-                curr += pair_numel
-
-            if distributed:
-                dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
-
-            curr = 0
-            for p in params:
-                delta = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
-                p.add_(delta)
-                curr += p.numel()
-
-        self._step_count = next_step_count
-        return loss
+    return X.T if transposed else X
 
 
 class Muon(torch.optim.Optimizer):
@@ -424,10 +131,10 @@ class Muon(torch.optim.Optimizer):
             params = group["params"]
             if not params:
                 continue
-            lr = float(group["lr"])
-            momentum = float(group["momentum"])
-            backend_steps = int(group["backend_steps"])
-            nesterov = bool(group["nesterov"])
+            lr = group["lr"]
+            momentum = group["momentum"]
+            backend_steps = group["backend_steps"]
+            nesterov = group["nesterov"]
 
             total_params = sum(int(p.numel()) for p in params)
             updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
@@ -435,14 +142,16 @@ class Muon(torch.optim.Optimizer):
             curr = 0
             for i, p in enumerate(params):
                 if i % world_size == rank and p.grad is not None:
-                    g = p.grad.detach().to(torch.float32)
+                    g = p.grad
                     state = self.state[p]
                     if "momentum_buffer" not in state:
                         state["momentum_buffer"] = torch.zeros_like(g)
                     buf = state["momentum_buffer"]
                     buf.mul_(momentum).add_(g)
-                    g = g.add(buf, alpha=momentum) if nesterov else buf
-                    g = _orthogonalize(g, steps=backend_steps)
+                    if nesterov:
+                        g = g.add(buf, alpha=momentum)
+                    g = zeropower_via_newtonschulz5(g, steps=backend_steps)
+                    # Scale correction from Muon reference implementations.
                     g *= max(1, g.size(0) / g.size(1)) ** 0.5
                     updates_flat[curr : curr + p.numel()] = g.reshape(-1)
                 curr += p.numel()
@@ -452,8 +161,8 @@ class Muon(torch.optim.Optimizer):
 
             curr = 0
             for p in params:
-                delta = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
-                p.add_(delta, alpha=-lr)
+                g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
+                p.add_(g, alpha=-lr)
                 curr += p.numel()
 
         return loss
@@ -798,49 +507,10 @@ class RMSNorm(nn.Module):
 
 
 class CastedLinear(nn.Linear):
-    # Keep dense weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
+    # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
     def forward(self, x: Tensor) -> Tensor:
         bias = self.bias.to(x.dtype) if self.bias is not None else None
         return F.linear(x, self.weight.to(x.dtype), bias)
-
-
-class CastedLoRALinear(nn.Module):
-    # Store LoRA factors in fp32 for optimizer quality, but execute the matmuls in bf16.
-    def __init__(self, in_features: int, out_features: int, rank: int):
-        super().__init__()
-        if rank <= 0:
-            raise ValueError(f"rank must be positive, got {rank}")
-        if rank > min(in_features, out_features):
-            raise ValueError(
-                f"rank={rank} exceeds min(in_features, out_features)={min(in_features, out_features)}"
-            )
-        self.in_features = in_features
-        self.out_features = out_features
-        self.rank = rank
-        self.lora_A = nn.Parameter(torch.empty(out_features, rank))
-        self.lora_B = nn.Parameter(torch.empty(in_features, rank))
-        self.reset_parameters()
-
-    def reset_parameters(self) -> None:
-        nn.init.normal_(self.lora_A, mean=0.0, std=1.0)
-        nn.init.normal_(self.lora_B, mean=0.0, std=1.0)
-        with torch.no_grad():
-            matrix_scale = math.sqrt(float(self.out_features) / float(self.in_features))
-            factor_scale = math.sqrt(matrix_scale)
-            self.lora_A.copy_(factor_scale * _orthogonalize(self.lora_A, steps=len(MUON_NS_COEFFS)))
-            self.lora_B.copy_(factor_scale * _orthogonalize(self.lora_B, steps=len(MUON_NS_COEFFS)))
-
-    def shrink_effective_weight(self, divisor: float = 1024.0) -> None:
-        if divisor <= 0.0:
-            raise ValueError(f"divisor must be positive, got {divisor}")
-        with torch.no_grad():
-            self.lora_A.div_(divisor)
-
-    def forward(self, x: Tensor) -> Tensor:
-        compute_dtype = torch.bfloat16 if x.device.type == "cuda" else x.dtype
-        x_compute = x.to(dtype=compute_dtype)
-        hidden = F.linear(x_compute, self.lora_B.to(dtype=compute_dtype).mT)
-        return F.linear(hidden, self.lora_A.to(dtype=compute_dtype))
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
@@ -888,8 +558,6 @@ class CausalSelfAttention(nn.Module):
         dim: int,
         num_heads: int,
         num_kv_heads: int,
-        enable_lora: bool,
-        lora_rank: int,
         rope_base: float,
         qk_gain_init: float,
     ):
@@ -904,13 +572,10 @@ class CausalSelfAttention(nn.Module):
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
         kv_dim = self.num_kv_heads * self.head_dim
-        linear_cls = (lambda in_f, out_f: CastedLoRALinear(in_f, out_f, rank=lora_rank)) if enable_lora else (
-            lambda in_f, out_f: CastedLinear(in_f, out_f, bias=False)
-        )
-        self.c_q = linear_cls(dim, dim)
-        self.c_k = linear_cls(dim, kv_dim)
-        self.c_v = linear_cls(dim, kv_dim)
-        self.proj = linear_cls(dim, dim)
+        self.c_q = CastedLinear(dim, dim, bias=False)
+        self.c_k = CastedLinear(dim, kv_dim, bias=False)
+        self.c_v = CastedLinear(dim, kv_dim, bias=False)
+        self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
@@ -940,14 +605,11 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int, enable_lora: bool, lora_rank: int):
+    def __init__(self, dim: int, mlp_mult: int):
         super().__init__()
         hidden = mlp_mult * dim
-        linear_cls = (lambda in_f, out_f: CastedLoRALinear(in_f, out_f, rank=lora_rank)) if enable_lora else (
-            lambda in_f, out_f: CastedLinear(in_f, out_f, bias=False)
-        )
-        self.fc = linear_cls(dim, hidden)
-        self.proj = linear_cls(hidden, dim)
+        self.fc = CastedLinear(dim, hidden, bias=False)
+        self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
@@ -962,16 +624,14 @@ class Block(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         mlp_mult: int,
-        enable_lora: bool,
-        lora_rank: int,
         rope_base: float,
         qk_gain_init: float,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, enable_lora, lora_rank, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult, enable_lora, lora_rank)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -994,8 +654,6 @@ class GPT(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         mlp_mult: int,
-        enable_lora: bool,
-        lora_rank: int,
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
@@ -1020,8 +678,6 @@ class GPT(nn.Module):
                     num_heads,
                     num_kv_heads,
                     mlp_mult,
-                    enable_lora,
-                    lora_rank,
                     rope_base,
                     qk_gain_init,
                 )
@@ -1038,9 +694,7 @@ class GPT(nn.Module):
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
         for module in self.modules():
-            if isinstance(module, CastedLoRALinear) and getattr(module, "_zero_init", False):
-                module.shrink_effective_weight()
-            if isinstance(module, CastedLinear) and getattr(module, "_zero_init", False):
+            if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
@@ -1075,12 +729,11 @@ class GPT(nn.Module):
 # -----------------------------
 
 def main() -> None:
+    global zeropower_via_newtonschulz5
+
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-
-    global _dualize_lora_muon_pair, _power_iteration
-    _dualize_lora_muon_pair = torch.compile(_dualize_lora_muon_pair)
-    _power_iteration = torch.compile(_power_iteration)
+    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
     # DISTRIBUTED + CUDA SETUP
@@ -1177,8 +830,6 @@ def main() -> None:
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
-        enable_lora=args.enable_lora,
-        lora_rank=args.lora_rank,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
@@ -1186,7 +837,7 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
     ).to(device).bfloat16()
     for module in base_model.modules():
-        if isinstance(module, (CastedLoRALinear, CastedLinear)):
+        if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
@@ -1194,40 +845,20 @@ def main() -> None:
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
-    # - untied dense lm_head (Adam) uses HEAD_LR
-    # - transformer dense matrices use MATRIX_LR via Muon when LoRA is disabled
-    # - transformer LoRA factors use MATRIX_LR via LoRA-Muon when LoRA is enabled
+    # - untied lm_head (Adam) uses HEAD_LR
+    # - matrix params in transformer blocks use MATRIX_LR via Muon
     # - vectors/scalars use SCALAR_LR via Adam
     block_named_params = list(base_model.blocks.named_parameters())
-    if args.enable_lora:
-        lora_pair_slots: dict[str, dict[str, nn.Parameter]] = {}
-        for name, p in block_named_params:
-            if name.endswith(".lora_A"):
-                lora_pair_slots.setdefault(name[:-7], {})["A"] = p
-            elif name.endswith(".lora_B"):
-                lora_pair_slots.setdefault(name[:-7], {})["B"] = p
-        matrix_params = []
-        for prefix in sorted(lora_pair_slots):
-            slot = lora_pair_slots[prefix]
-            if "A" not in slot or "B" not in slot:
-                raise RuntimeError(f"Incomplete LoRA factor pair for {prefix}")
-            matrix_params.extend((slot["A"], slot["B"]))
-        scalar_params = [
-            p
-            for name, p in block_named_params
-            if not (name.endswith(".lora_A") or name.endswith(".lora_B"))
-        ]
-    else:
-        matrix_params = [
-            p
-            for name, p in block_named_params
-            if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-        ]
-        scalar_params = [
-            p
-            for name, p in block_named_params
-            if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-        ]
+    matrix_params = [
+        p
+        for name, p in block_named_params
+        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    ]
+    scalar_params = [
+        p
+        for name, p in block_named_params
+        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+    ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
@@ -1237,26 +868,12 @@ def main() -> None:
         eps=args.adam_eps,
         fused=True,
     )
-    if args.enable_lora:
-        optimizer_muon = LoRAMuon(
-            matrix_params,
-            lr=args.matrix_lr,
-            momentum=args.muon_momentum,
-            backend_steps=args.muon_backend_steps,
-            inv_eps=args.lora_inv_eps,
-            inv_scale=args.lora_inv_scale,
-            enable_gauge_rebalance=args.enable_gauge_rebalance,
-            gauge_rebalance_interval=args.gauge_rebalance_interval,
-            gauge_rebalance_alpha=args.gauge_rebalance_alpha,
-            gauge_rebalance_eps=args.gauge_rebalance_eps,
-        )
-    else:
-        optimizer_muon = Muon(
-            matrix_params,
-            lr=args.matrix_lr,
-            momentum=args.muon_momentum,
-            backend_steps=args.muon_backend_steps,
-        )
+    optimizer_muon = Muon(
+        matrix_params,
+        lr=args.matrix_lr,
+        momentum=args.muon_momentum,
+        backend_steps=args.muon_backend_steps,
+    )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.Adam(
@@ -1281,15 +898,10 @@ def main() -> None:
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
-        f"tie_embeddings:{args.tie_embeddings} enable_lora:{args.enable_lora} lora_rank:{args.lora_rank} embed_lr:{token_lr} "
+        f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
-    if args.enable_lora:
-        log0(
-            f"gauge_rebalance:{args.enable_gauge_rebalance} "
-            f"interval:{args.gauge_rebalance_interval} alpha:{args.gauge_rebalance_alpha}"
-        )
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
